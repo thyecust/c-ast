@@ -1,0 +1,3 @@
+*.ast
+*.bcanalyzer_dump
+PCHInternals_en.md
