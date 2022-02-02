@@ -8,7 +8,55 @@
 
 ## 通过 Clang 使用 PCH
 
+Clang 编译器前端，`clang -cc1`，支持两个用以生成和使用 PCH 文件的命令行选项。
+
+如果要用 `clang -cc1` 生成 PCH 文件，使用 `-emit-pch` 选项
+
+```bash
+clang -cc1 test.h -emit-pch -o test.h.pch
+```
+
+使用 `clang` 来生成 PCH 文件的时候这个选项是透明的。生成的 PCH 文件包含完成了解析（parsing）和语义分析的，编译器内部表示的序列化形式。这个 PCH 文件可以通过 `-include-pch` 选项作为 prefix 头文件使用
+
+```bash
+clang -cc1 -include-pch test.h.pch test.c -o test.s
+```
+
 ## 设计哲学
+
+PCH 的意义在于提升整个项目的总体编译时间，所以 PCH 的设计完全是性能驱动的。PCH 的用例相对简单：当项目中有一些常用的头文件几乎被每一个源文件引用的时候，我们把这一组头文件*预编译*成一个单一的预编译头（PCH）文件。然后，当编译项目中的源代码文件的时候，我们首先加载这个 PCH 文件（作为一个 prefix 头文件），相当于引入了这一组头文件。
+
+一个 PCH 实现在这种情况下才可以提升性能
+
+* 加载 PCH 显著地快于重新解析 PCH 文件中包含的一组头文件。因此，PCH 的设计尝试尽可能地最小化读 PCH 文件的成本。理想情况下，这个成本不随 PCH 文件的大小而变化。
+* 最初生成 PCH 文件的成本不要太大以至于抵消了对每个源代码文件单独带来的性能优化，因为我们只在这组头文件第一次出现的时候才需要解析。这对于多核系统来说尤为重要，因为只有当所有的编译都要求 PCH 文件保持最新时，PCH 文件生成才会序列化构建。
+
+Clang 中实现的模块，使用和 PCH 一样的机制，来序列化 AST 文件（每个模块对应一个 AST 文件）和使用这些 AST。从实现的角度看，模块是 PCH 的推广，解除了对 PCH 的一些限制。特别是只能由一个 PCH 而且必须包含在翻译单元的开头。模块的 AST 文件格式拓展在[模块](https://clang.llvm.org/docs/PCHInternals.html#pchinternals-modules)的部分单独讨论。
+
+Clang 的 AST 文件设计为一个紧密的硬盘表示，这样最小化了创建和首次加载的成本。AST 文件本身包含一个 Clang AST 的序列化表示和一些支持性数据结构，使用和 [LLVM 二进制流格式（LLVM's bitstream format）](https://llvm.org/docs/BitCodeFormat.html)相同的压缩二进制数据流保存。
+
+Clang 的 AST 文件是从硬盘上惰性加载的。当 AST 文件首次加载时，Clang 只读取 AST 文件中的小部分数据，明确每个重要的数据结构存储在哪里。这时候读取的数据量是和 AST 文件的大小无关的，所以很大的 AST 文件并不会使用很长的 AST 加载时间。AST 文件中的实际头文件数据——宏，函数，变量，类型，等等——只有在它们在用户的代码中被引用的时候才会加载，这时只有该实体（以及该实体所依赖的实体）从 AST 文件中反序列化出来。使用这种方法，一个翻译单元使用 AST 文件的成本和它实际使用 AST 文件的代码量成正比，而不是和 AST 文件本身的大小成正比。
+
+当使用 `-print-stats` 选项的时候，Clang 可以描述到底 AST 文件中的多少从硬盘上加载出来。对于一个使用了 Apple 的 `Cocoa.h` 头文件（已经进行预编译）的简单 HelloWorld 程序，这个选项描述出有多么少的预编译头是实际需要的
+
+```plain
+*** AST File Statistics:
+  895/39981 source location entries read (2.238563%)
+  19/15315 types read (0.124061%)
+  20/82685 declarations read (0.024188%)
+  154/58070 identifiers read (0.265197%)
+  0/7260 selectors read (0.000000%)
+  0/30842 statements read (0.000000%)
+  4/8400 macros read (0.047619%)
+  1/4995 lexical declcontexts read (0.020020%)
+  0/4413 visible declcontexts read (0.000000%)
+  0/7230 method pool entries read (0.000000%)
+  0 method pool misses
+```
+
+对于这个简单的程序，只有很少的源代码位置、类型、声明、标识符和宏实际上从预编译头中反序列化出来了。这些统计对于判断通过实现惰性加载，AST 文件实现到底能不能提升性能来说很有帮助。
+
+PCH 可以是链式的。当你创建一个 PCH 文件，这个文件里引入一个已经存在的 PCH 的时候，Clang 可以在新的 PCH 里引用原有的文件并且只向新文件里写入新数据。例如，你可以创建一个 PCH，包含了整个项目里非常常用的头文件，然后对每个源代码文件生成一个这个文件自己需要的 PCH，这样重新编译这个文件就会非常快，也不需要重复来自所有常用头文件的数据。链式 PCH 背后的机制在[后面]进行讨论。
 
 ## AST 文件格式
 
