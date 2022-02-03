@@ -1,3 +1,4 @@
 *.ast
 *.bcanalyzer_dump
+*.xxd
 PCHInternals_en.md
